@@ -1,0 +1,378 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Parameters:
+
+  QldbLedgerName:
+    Type: String
+    Default: qldb-stream
+    Description: The QLDB ledger name
+
+  DomainName:
+    Type: String
+    Default: qldb-stream-os
+    Description: The OpenSearch domain name
+
+  OpenSearchIndexName:
+    Type: String
+    Default: person
+    Description: The OpenSearch index name to insert data into
+
+  OpenSearchMasterUsername:
+    Type: String
+    Description: The OpenSearch master username
+
+  OpenSearchMasterPassword:
+    Type: String
+    Description: The OpenSearch master password
+    MinLength: 8
+    AllowedPattern: '^(?=.{8,})(?=.*[a-z])(?=.*[A-Z])(?=.*[0-9])(?=.*[@#$%^&+=]).*$'
+    ConstraintDescription: Passwords must be at least 8 and no more than 64 characters and must contain at least one uppercase letter, one lowercase letter, one number, and one special character (@#$%^&+=).
+    NoEcho: true
+
+  KinesisStreamName:
+    Type: String
+    Default: qldb-data-stream
+    Description: The Kinesis Data Stream name
+
+  DeliveryStreamName:
+    Type: String
+    Default: qldb-to-openseach-delivery
+    Description: The Kinesis Firehose Delivery Stream name
+
+  QldbStreamStartTime:
+    Type: String
+    Default: "2022-09-04T00:00:00Z"
+    Description: The inclusive start date and time from which to start streaming QLDB data
+    AllowedPattern: "^\\d{4}(-\\d{2}){2}T(\\d{2}:){2}\\d{2}Z$"
+
+  LambdaTransformationName:
+    Type: String
+    Default: firehose-data-transform
+    Description: Lambda to transform data from Kinesis Firehose
+
+Resources:
+  
+  myQLDBLedger: 
+      Type: "AWS::QLDB::Ledger"
+      Properties:
+        DeletionProtection: false
+        KmsKey: "AWS_OWNED_KMS_KEY"
+        Name: !Ref QldbLedgerName
+        PermissionsMode: "STANDARD"
+
+  myOpenSearchDomain:
+      Type: "AWS::OpenSearchService::Domain"
+      Properties:
+        DomainName: !Ref DomainName
+        EngineVersion: "OpenSearch_1.3"
+        ClusterConfig:
+          InstanceType: "t3.small.search"
+          InstanceCount: 1
+          DedicatedMasterEnabled: false
+          ZoneAwarenessEnabled: false
+        EBSOptions:
+          EBSEnabled: true
+          VolumeSize: 10
+        EncryptionAtRestOptions:
+          Enabled: true
+        NodeToNodeEncryptionOptions:
+          Enabled: true
+        DomainEndpointOptions:
+          EnforceHTTPS: true
+        AdvancedOptions:
+          override_main_response_version: "true"
+        AdvancedSecurityOptions:
+          Enabled: true
+          InternalUserDatabaseEnabled: true
+          MasterUserOptions:
+              MasterUserName: !Ref OpenSearchMasterUsername
+              MasterUserPassword: !Ref OpenSearchMasterPassword
+        AccessPolicies:
+          Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Principal:
+                AWS: "*"
+              Action: "es:*"
+              Resource: !Sub "arn:aws:es:${AWS::Region}:${AWS::AccountId}:domain/${DomainName}/*"
+
+  myKinesisStream:
+    Type: AWS::Kinesis::Stream
+    Properties: 
+      Name: !Ref KinesisStreamName
+      ShardCount: 1
+      StreamModeDetails: 
+          StreamMode: PROVISIONED
+
+  myQldbStreamManagedPolicy:
+    Type: 'AWS::IAM::ManagedPolicy'
+    Properties:
+      ManagedPolicyName: !Sub "${AWS::StackName}-QldbStreamManagedPolicy"
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: QLDBStreamKinesisPermissions
+            Effect: Allow
+            Action:
+              - 'kinesis:PutRecord*'
+              - 'kinesis:DescribeStream'
+              - 'kinesis:ListShards'
+            Resource: !GetAtt myKinesisStream.Arn
+
+  myQldbStreamRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-QldbStreamRole"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - qldb.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      ManagedPolicyArns:
+        - !Ref myQldbStreamManagedPolicy
+
+  myQldbStream:
+    Type: AWS::QLDB::Stream
+    Properties:
+      LedgerName: !Ref myQLDBLedger
+      InclusiveStartTime: !Ref QldbStreamStartTime
+      KinesisConfiguration: 
+        AggregationEnabled: true
+        StreamArn: !GetAtt myKinesisStream.Arn
+      RoleArn: !GetAtt myQldbStreamRole.Arn
+      StreamName: !Sub "${QldbLedgerName}-stream"
+
+  myLambdaDataTransformLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: 
+      LogGroupName: !Sub "/aws/lambda/${LambdaTransformationName}"
+      RetentionInDays: 7
+
+  myLambdaDataTransformationManagedPolicy:
+    Type: 'AWS::IAM::ManagedPolicy'
+    Properties:
+      ManagedPolicyName: !Sub "${AWS::StackName}-LambdaDataTransformationManagedPolicy"
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - 'logs:CreateLogStream'
+              - 'logs:PutLogEvents'
+            Resource: !Join ["", [!GetAtt myLambdaDataTransformLogGroup.Arn, "/*"]]
+
+  myLambdaDataTransformationStreamRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-LambdaDataTransformationRole"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      ManagedPolicyArns:
+        - !Ref myLambdaDataTransformationManagedPolicy
+
+  AWSKinesisAggLayer:
+    Type: 'AWS::Lambda::LayerVersion'
+    Properties:
+      CompatibleRuntimes:
+        - python3.8
+      Content:
+        S3Bucket: 'oarp-labs'
+        S3Key: lambda_layers/python/aws-kinesis-agg-0.0.1.zip
+      Description: aws-kinesis-agg
+      LayerName: aws-kinesis-agg
+      LicenseInfo: MIT
+  
+  PyIon2JsonLayer:
+    Type: 'AWS::Lambda::LayerVersion'
+    Properties:
+      CompatibleRuntimes:
+        - python3.8
+      Content:
+        S3Bucket: !Sub 'oarp-labs'
+        S3Key: lambda_layers/python/pyion-2-json-0.0.1.zip
+      Description: pyion-2-json
+      LayerName: pyion-2-json
+      LicenseInfo: MIT
+
+  myLambdaDataTransformationFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: !Ref LambdaTransformationName
+      Description: "An Amazon Kinesis Firehose stream processor that accesses the records in the input and returns them with a processing status."
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt myLambdaDataTransformationStreamRole.Arn
+      Code:
+        S3Bucket: 'oarp-labs'
+        S3Key: >-
+          lambda_functions/python/QldbStreamTransform.zip
+      Runtime: python3.8
+      MemorySize: 128
+      Timeout: 60
+      Layers:
+        - Ref: PyIon2JsonLayer
+        - Ref: AWSKinesisAggLayer
+
+  BucketBackupData:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "firehose-delivery-backup-${AWS::AccountId}-${AWS::Region}"
+
+  myDeliveryStreamPolicy:
+    Type: 'AWS::IAM::ManagedPolicy'
+    Properties:
+      ManagedPolicyName: !Sub "${AWS::StackName}-KinesisFirehosePolicy-${AWS::Region}"
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - 's3:AbortMultipartUpload'
+              - 's3:GetBucketLocation'
+              - 's3:GetObject'
+              - 's3:ListBucket'
+              - 's3:ListBucketMultipartUploads'
+              - 's3:PutObject'
+            Resource:
+              - !GetAtt BucketBackupData.Arn
+              - !Join ["", [!GetAtt BucketBackupData.Arn, "/*"]]
+          - Effect: Allow
+            Action:
+              - 'lambda:InvokeFunction'
+              - 'lambda:GetFunctionConfiguration'
+            Resource: !Join ["", [!GetAtt myLambdaDataTransformationFunction.Arn, ":$LATEST"]]
+          - Effect: Allow
+            Action:
+              - 'kms:GenerateDataKey'
+              - 'kms:Decrypt'
+            Resource: !Sub "arn:aws:kms:${AWS::Region}:${AWS::AccountId}:key/%FIREHOSE_POLICY_TEMPLATE_PLACEHOLDER%"
+          
+          - Effect: Allow
+            Action:
+              - "ec2:DescribeVpcs"
+              - "ec2:DescribeVpcAttribute"
+              - "ec2:DescribeSubnets"
+              - "ec2:DescribeSecurityGroups"
+              - "ec2:DescribeNetworkInterfaces"
+              - "ec2:CreateNetworkInterface"
+              - "ec2:CreateNetworkInterfacePermission"
+              - "ec2:DeleteNetworkInterface"
+            Resource: "*"
+          
+          - Effect: Allow
+            Action:
+              - "es:DescribeElasticsearchDomain"
+              - "es:DescribeElasticsearchDomains"
+              - "es:DescribeElasticsearchDomainConfig"
+              - "es:ESHttpPost"
+              - "es:ESHttpPut"
+              - "es:ESHttpGet"
+            Resource: 
+              - !GetAtt myOpenSearchDomain.Arn
+              - !Join ["", [!GetAtt myOpenSearchDomain.Arn, "/*"]]
+
+          - Effect: Allow
+            Action:
+              - 'logs:PutLogEvents'
+            Resource: "*"
+
+          - Effect: Allow
+            Action:
+              - 'kinesis:DescribeStream'
+              - 'kinesis:GetShardIterator'
+              - 'kinesis:GetRecords'
+              - 'kinesis:ListShards'
+            Resource: !GetAtt myKinesisStream.Arn
+
+          - Effect: Allow
+            Action:
+              - 'kms:Decrypt'
+            Resource: !Sub "arn:aws:kms:${AWS::Region}:${AWS::AccountId}:key/%FIREHOSE_POLICY_TEMPLATE_PLACEHOLDER%"
+
+  myDeliveryStreamRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-KinesisFirehoseRole-${AWS::Region}"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - firehose.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      ManagedPolicyArns:
+        - !Ref myDeliveryStreamPolicy
+
+  myDeliveryStreamLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: 
+      LogGroupName: !Sub "/aws/kinesisfirehose/${DeliveryStreamName}"
+      RetentionInDays: 7
+  
+  myDeliveryStreamLogStream:
+    Type: AWS::Logs::LogStream
+    Properties: 
+      LogGroupName: !Ref myDeliveryStreamLogGroup
+      LogStreamName: DestinationDelivery
+
+  myDeliveryStream:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    Properties: 
+      DeliveryStreamName: !Ref DeliveryStreamName
+      DeliveryStreamType: KinesisStreamAsSource
+      KinesisStreamSourceConfiguration: 
+          KinesisStreamARN: !GetAtt myKinesisStream.Arn
+          RoleARN: !GetAtt myDeliveryStreamRole.Arn
+      AmazonopensearchserviceDestinationConfiguration: 
+        BufferingHints:
+          IntervalInSeconds: 60
+          SizeInMBs: 1
+        CloudWatchLoggingOptions:
+          Enabled: true
+          LogGroupName: !Sub "/aws/kinesisfirehose/${DeliveryStreamName}"
+          LogStreamName: DestinationDelivery
+        DomainARN: !GetAtt myOpenSearchDomain.Arn
+        IndexName: !Ref OpenSearchIndexName
+        ProcessingConfiguration:
+            Enabled: true
+            Processors: 
+              - Type: Lambda
+                Parameters:
+                  - ParameterName: "LambdaArn"
+                    ParameterValue: !Join ["", [!GetAtt myLambdaDataTransformationFunction.Arn, ":$LATEST"]]
+                  - ParameterName: "NumberOfRetries"
+                    ParameterValue: "3"
+                  - ParameterName: "RoleArn"
+                    ParameterValue: !GetAtt myDeliveryStreamRole.Arn
+                  - ParameterName: "BufferSizeInMBs"
+                    ParameterValue: "1"
+                  - ParameterName: "BufferIntervalInSeconds"
+                    ParameterValue: "60"
+        RoleARN: !GetAtt myDeliveryStreamRole.Arn
+        S3BackupMode: "FailedDocumentsOnly"
+        S3Configuration:
+          BucketARN: "arn:aws:s3:::qldb-stream-backup"
+          RoleARN: !GetAtt myDeliveryStreamRole.Arn
+
+Outputs:
+  OpenSearchDashboard:
+    Description: The OpenSearch Dashboard URL
+    Value: !Join ["", ["https://", !GetAtt myOpenSearchDomain.DomainEndpoint, "/_dashboards"]]
+  KinesisFirehoseRole:
+    Description: The IAM Role assumed by Kinesis Data Firehose
+    Value: !GetAtt myDeliveryStreamRole.Arn
